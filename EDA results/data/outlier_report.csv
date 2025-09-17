@@ -1,0 +1,6 @@
+column,low_bound,high_bound,pct_outliers
+realrinc,-20366.5,55693.5,5.1
+childs,-4.5,7.5,0.68
+prestg10,11.0,75.0,0.39
+age,-1.5,82.5,0.15
+year,1956.0,2036.0,0.0
