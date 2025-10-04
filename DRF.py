@@ -164,7 +164,10 @@ def main():
     for pg in param_grid:
         fold_crps = []
         for fold, (tr_idx, val_idx) in enumerate(kf.split(X), 1):
-            X_tr, X_val = X[tr_idx], X[val_idx]
+            prep = fit_preprocessor(X_df.iloc[tr_idx], ohe_drop_first=False, include_is_working=True)
+            X_tr = prep.transform(X_df.iloc[tr_idx]).to_numpy(float)
+            X_val = prep.transform(X_df.iloc[val_idx]).to_numpy(float)
+            # X_tr, X_val = X[tr_idx], X[val_idx]
             y_tr, y_val = y[tr_idx], y[val_idx]
 
             rf = RandomForestRegressor(
