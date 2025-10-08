@@ -14,6 +14,7 @@ from preprocessingW import fit_preprocessor  # adjust name if needed
 RNG_SEED = 69
 OUTER_FOLDS = 5
 INNER_FOLDS = 5
+N_SAMPLES_CV_INNER = 512
 N_SAMPLES_CV = 1024
 N_SAMPLES_TEST = 1000
 
@@ -143,16 +144,25 @@ def main():
     y = pd.read_csv(TRN_Y_PATH).values.ravel()
     X_test_df = pd.read_csv(TST_X_PATH)
 
+    MIN_LEAF = [5, 10, 20, 40]
+    MAX_FEAT = [0.35, 0.5, 0.65]
+    TAU      = [0.00, 0.03, 0.06, 0.10]
+
+    N_EST_INNER = 500
+    N_EST_OUTER = 600
+    N_EST_FINAL = 800
+
     # 3) Nested CV (outer=5, inner=5)
     param_grid = [
         #{"n_estimators": 100, "max_depth": None, "min_samples_leaf": 5, "max_features": "sqrt", "tau": 0.0},
         #{"n_estimators": 100, "max_depth": None, "min_samples_leaf": 5, "max_features": 0.5,   "tau": 0.05},
-        {"n_estimators": 100, "max_depth": None, "min_samples_leaf": 5, "max_features": 0.5,   "tau": 0.1},
+        #{"n_estimators": 100, "max_depth": None, "min_samples_leaf": 5, "max_features": 0.5,   "tau": 0.1},
         #{"n_estimators": 400, "max_depth": None, "min_samples_leaf": 5, "max_features": 0.5,   "tau": 0.0},
-        {"n_estimators": 800, "max_depth": None, "min_samples_leaf": 10, "max_features": 0.5, "tau": 0.05}, #more trees and min samples, more averaging --> less variance
+        #{"n_estimators": 800, "max_depth": None, "min_samples_leaf": 10, "max_features": 0.5, "tau": 0.05}, #more trees and min samples, more averaging --> less variance
+        {"min_samples_leaf": ml, "max_features": mf, "tau": t} for ml in MIN_LEAF for mf in MAX_FEAT for t in TAU
     ]
 
-    outer_kf = KFold(n_splits=OUTER_FOLDS, shuffle=True, random_state=RNG_SEED)
+    #outer_kf = KFold(n_splits=OUTER_FOLDS, shuffle=True, random_state=RNG_SEED)
     outer_scores: List[float] = []
     outer_choices: List[dict] = []
 
@@ -173,7 +183,7 @@ def main():
         y_te_out = y[te_out_idx]
 
         # ---- Inner HPO with 5-fold CV inside outer-train ----
-        inner_kf = KFold(n_splits=INNER_FOLDS, shuffle=True, random_state=RNG_SEED + o)
+        #inner_kf = KFold(n_splits=INNER_FOLDS, shuffle=True, random_state=RNG_SEED + o)
         cfg_scores: List[Tuple[dict, float]] = []
 
         # stratisfy inner folds by 'year' to ensure balanced distribution
@@ -196,8 +206,8 @@ def main():
                 y_va_in = y_tr_out[va_in_idx]
 
                 rf = RandomForestRegressor(
-                    n_estimators=pg["n_estimators"],
-                    max_depth=pg["max_depth"],
+                    n_estimators=N_EST_INNER,
+                    max_depth=None,
                     min_samples_leaf=pg["min_samples_leaf"],
                     max_features=pg["max_features"],
                     bootstrap=True,
@@ -207,7 +217,7 @@ def main():
                 drf = DistributionalForest(rf, use_log1p=True, tau=pg["tau"]).fit(X_tr_in, y_tr_in)
 
                 rng = np.random.default_rng(RNG_SEED + o*100 + i)
-                samples_va = drf.sample(X_va_in, n_samples=N_SAMPLES_CV, rng=rng)
+                samples_va = drf.sample(X_va_in, n_samples=N_SAMPLES_CV_INNER, rng=rng)
                 crps_i = crps_ensemble(y_va_in, samples_va).mean()
                 inner_fold_scores.append(float(crps_i))
                 print(f"[Outer {o} | Inner {i}] Params {pg}  ->  CRPS: {crps_i:.6f}")
@@ -223,8 +233,8 @@ def main():
 
         # ---- Outer evaluation: fit on outer-train with best_pg, score on outer-test ----
         rf_out = RandomForestRegressor(
-            n_estimators=best_pg["n_estimators"],
-            max_depth=best_pg["max_depth"],
+            n_estimators=N_EST_OUTER,
+            max_depth=None,
             min_samples_leaf=best_pg["min_samples_leaf"],
             max_features=best_pg["max_features"],
             bootstrap=True,
@@ -242,23 +252,63 @@ def main():
     print("Outer-fold CRPS:", [f"{s:.6f}" for s in outer_scores])
     print("Mean OUTER CRPS:", f"{np.mean(outer_scores):.6f}")
 
+    # 4) PRODUCTION HPO on ALL training, then final refit + export
+    from sklearn.model_selection import StratifiedKFold
 
-    # 4) Final refit on ALL training with chosen params, then predict test
-    from collections import Counter
+    # same stratification you used in nested CV (year-only)
+    strat_all = X_df["year"].to_numpy()
+    inner_full = StratifiedKFold(n_splits=INNER_FOLDS, shuffle=True, random_state=RNG_SEED)
 
-    # choose final params as the most frequently selected across outer folds
-    mode_key, _ = Counter(tuple(sorted(d.items())) for d in outer_choices).most_common(1)[0]
-    best_pg_final = dict(mode_key)
-    print("\nFinal params chosen for full refit:", best_pg_final)
+    cfg_scores_full: List[Tuple[dict, float]] = []
 
-    # fit preprocessor on ALL train, transform train and test
+    for pg in param_grid:
+        inner_scores = []
+        for i, (tr_in_idx, va_in_idx) in enumerate(inner_full.split(X_df, strat_all), 1):
+            # fit preprocessor on inner-train only
+            inner_tr_rows = X_df.iloc[tr_in_idx]
+            inner_va_rows = X_df.iloc[va_in_idx]
+            prep_in = fit_preprocessor(inner_tr_rows, ohe_drop_first=False, include_is_working=True)
+
+            X_tr_in = prep_in.transform(inner_tr_rows).to_numpy(dtype=float)
+            y_tr_in = y[tr_in_idx]
+            X_va_in = prep_in.transform(inner_va_rows).to_numpy(dtype=float)
+            y_va_in = y[va_in_idx]
+
+            rf = RandomForestRegressor(
+                n_estimators=N_EST_FINAL,
+                max_depth=None,
+                min_samples_leaf=pg["min_samples_leaf"],
+                max_features=pg["max_features"],
+                bootstrap=True,
+                n_jobs=-1,
+                random_state=RNG_SEED + 9000 + i  # fixed across configs per split not required here
+            )
+            drf = DistributionalForest(rf, use_log1p=True, tau=pg["tau"]).fit(X_tr_in, y_tr_in)
+
+            # common random numbers per split for fair comparison
+            rng = np.random.default_rng(RNG_SEED + 4242 + i)
+            samples_va = drf.sample(X_va_in, n_samples=N_SAMPLES_CV, rng=rng)
+            crps_i = crps_ensemble(y_va_in, samples_va).mean()
+            inner_scores.append(float(crps_i))
+            print(f"[PROD | Inner {i}] Params {pg} -> CRPS: {crps_i:.6f}")
+
+        mean_inner = float(np.mean(inner_scores))
+        cfg_scores_full.append((pg, mean_inner))
+        print(f"[PROD] Params {pg} -> Mean INNER-CRPS: {mean_inner:.6f}")
+
+    # pick the best config on full-data inner CV
+    best_pg_final, best_inner_full = min(cfg_scores_full, key=lambda t: t[1])
+    print("\nFinal params chosen by FULL-DATA HPO:", best_pg_final, "(mean INNER-CRPS:", f"{best_inner_full:.6f})")
+
+    # Fit preprocessor on ALL training; transform train & test once
     prep_all = fit_preprocessor(X_df, ohe_drop_first=False, include_is_working=True)
-    X_all   = prep_all.transform(X_df).to_numpy(dtype=float)
-    X_test  = prep_all.transform(X_test_df).to_numpy(dtype=float)
+    X_all  = prep_all.transform(X_df).to_numpy(dtype=float)
+    X_test = prep_all.transform(X_test_df).to_numpy(dtype=float)
 
+    # Final refit on all training with the chosen params
     rf_full = RandomForestRegressor(
-        n_estimators=best_pg_final["n_estimators"],
-        max_depth=best_pg_final["max_depth"],
+        n_estimators=N_EST_FINAL,
+        max_depth=None,
         min_samples_leaf=best_pg_final["min_samples_leaf"],
         max_features=best_pg_final["max_features"],
         bootstrap=True,
@@ -273,6 +323,38 @@ def main():
     print("Test samples shape:", samples_test.shape)  # should be (n_test, 1000)
     np.save(OUT_PATH, samples_test.astype(np.float32))
     print(f"Saved: {OUT_PATH}")
+
+    
+    # # 4) Final refit on ALL training with chosen params, then predict test
+    # from collections import Counter
+
+    # # choose final params as the most frequently selected across outer folds
+    # mode_key, _ = Counter(tuple(sorted(d.items())) for d in outer_choices).most_common(1)[0]
+    # best_pg_final = dict(mode_key)
+    # print("\nFinal params chosen for full refit:", best_pg_final)
+
+    # # fit preprocessor on ALL train, transform train and test
+    # prep_all = fit_preprocessor(X_df, ohe_drop_first=False, include_is_working=True)
+    # X_all   = prep_all.transform(X_df).to_numpy(dtype=float)
+    # X_test  = prep_all.transform(X_test_df).to_numpy(dtype=float)
+
+    # rf_full = RandomForestRegressor(
+    #     n_estimators=best_pg_final["n_estimators"],
+    #     max_depth=best_pg_final["max_depth"],
+    #     min_samples_leaf=best_pg_final["min_samples_leaf"],
+    #     max_features=best_pg_final["max_features"],
+    #     bootstrap=True,
+    #     n_jobs=-1,
+    #     random_state=RNG_SEED
+    # )
+    # drf_full = DistributionalForest(rf_full, use_log1p=True, tau=best_pg_final["tau"]).fit(X_all, y)
+
+    # # 5) generate TEST samples (original scale), save predictions.npy
+    # rng_master = np.random.default_rng(RNG_SEED)
+    # samples_test = drf_full.sample(X_test, n_samples=N_SAMPLES_TEST, rng=rng_master)
+    # print("Test samples shape:", samples_test.shape)  # should be (n_test, 1000)
+    # np.save(OUT_PATH, samples_test.astype(np.float32))
+    # print(f"Saved: {OUT_PATH}")
 
 if __name__ == "__main__":
     main()
