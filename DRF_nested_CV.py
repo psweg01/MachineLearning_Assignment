@@ -14,7 +14,7 @@ from preprocessingW import fit_preprocessor  # adjust name if needed
 RNG_SEED = 69
 OUTER_FOLDS = 5
 INNER_FOLDS = 5
-N_SAMPLES_CV = 256
+N_SAMPLES_CV = 1024
 N_SAMPLES_TEST = 1000
 
 TRN_X_PATH = "MachineLearning_Assignment/data/X_trn.csv"
@@ -149,13 +149,20 @@ def main():
         #{"n_estimators": 100, "max_depth": None, "min_samples_leaf": 5, "max_features": 0.5,   "tau": 0.05},
         {"n_estimators": 100, "max_depth": None, "min_samples_leaf": 5, "max_features": 0.5,   "tau": 0.1},
         #{"n_estimators": 400, "max_depth": None, "min_samples_leaf": 5, "max_features": 0.5,   "tau": 0.0},
+        {"n_estimators": 800, "max_depth": None, "min_samples_leaf": 10, "max_features": 0.5, "tau": 0.05}, #more trees and min samples, more averaging --> less variance
     ]
 
     outer_kf = KFold(n_splits=OUTER_FOLDS, shuffle=True, random_state=RNG_SEED)
     outer_scores: List[float] = []
     outer_choices: List[dict] = []
 
-    for o, (tr_out_idx, te_out_idx) in enumerate(outer_kf.split(X_df), 1):
+    # stratisfy outer folds by 'year' to ensure balanced distribution
+    from sklearn.model_selection import StratifiedKFold
+    strat_outer = X_df["year"].to_numpy()
+    outer_kf = StratifiedKFold(n_splits=OUTER_FOLDS, shuffle=True, random_state=RNG_SEED)
+
+    #for o, (tr_out_idx, te_out_idx) in enumerate(outer_kf.split(X_df), 1):
+    for o, (tr_out_idx, te_out_idx) in enumerate(outer_kf.split(X_df, strat_outer), 1):
         print(f"\n================  OUTER FOLD {o}/{OUTER_FOLDS}  ================")
 
         # ---- Outer preprocessor (fit on outer-train only) ----
@@ -169,9 +176,14 @@ def main():
         inner_kf = KFold(n_splits=INNER_FOLDS, shuffle=True, random_state=RNG_SEED + o)
         cfg_scores: List[Tuple[dict, float]] = []
 
+        # stratisfy inner folds by 'year' to ensure balanced distribution
+        strat_inner = strat_outer[tr_out_idx]
+        inner_kf = StratifiedKFold(n_splits=INNER_FOLDS, shuffle=True, random_state=RNG_SEED + o)
+
         for pg in param_grid:
             inner_fold_scores: List[float] = []
-            for i, (tr_in_idx, va_in_idx) in enumerate(inner_kf.split(X_tr_out), 1):
+            #for i, (tr_in_idx, va_in_idx) in enumerate(inner_kf.split(X_tr_out), 1):
+            for i, (tr_in_idx, va_in_idx) in enumerate(inner_kf.split(np.zeros_like(strat_inner), strat_inner), 1):
                 # Inner preprocessor (fit on inner-train only)
                 # Use raw frames indexed by the outer-train indices to avoid leakage
                 inner_tr_rows = X_df.iloc[tr_out_idx].iloc[tr_in_idx]
